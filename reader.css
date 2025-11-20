@@ -106,6 +106,8 @@
   margin: 0;
   appearance: none;
   -webkit-appearance: none;
+  -webkit-tap-highlight-color: transparent;
+  outline: none;
   text-align: left;
   white-space: nowrap;
   background-clip: padding-box;
@@ -120,6 +122,26 @@
 .rm-links-toggle:hover {
   color: var(--rm-text, #111);
   text-decoration: underline;
+}
+.rm-style-toggle:focus,
+.rm-style-toggle:active,
+.rm-style-toggle:focus-visible,
+.rm-style-toggle:hover,
+.rm-images-toggle:focus,
+.rm-images-toggle:active,
+.rm-images-toggle:focus-visible,
+.rm-images-toggle:hover,
+.rm-links-toggle:focus,
+.rm-links-toggle:active,
+.rm-links-toggle:focus-visible,
+.rm-links-toggle:hover,
+.rm-move-top:focus,
+.rm-move-top:active,
+.rm-move-top:focus-visible,
+.rm-move-top:hover {
+  outline: none !important;
+  box-shadow: none !important;
+  background: transparent !important;
 }
 
 .rm-close {
@@ -395,14 +417,30 @@
 .rm-font-choice {
   width: 100%;
   text-align: left;
-  background: transparent;
-  border: none;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  border-radius: 0;
+  appearance: none;
+  -webkit-appearance: none;
   padding: 4px 0;
   cursor: pointer;
   color: var(--rm-text);
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.rm-font-choice:focus,
+.rm-font-choice:active,
+.rm-font-choice:focus-visible,
+.rm-font-choice.active,
+.rm-font-choice:hover {
+  outline: none !important;
+  box-shadow: none !important;
+  background: transparent !important;
+  border: none !important;
+  color: var(--rm-text);
 }
 
 .rm-font-choice::before {

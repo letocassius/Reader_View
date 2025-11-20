@@ -92,6 +92,10 @@ function scoreElement(el) {
 const SKIP_PATTERNS =
   /(related|recommend|trending|comment|promo|ad(vert)?|footer|sidebar|sponsored|nav|more-articles|more-stories|newsletter)/i;
 
+const ALLOWED_VIDEO_REGEX =
+  (typeof Readability === 'function' && Readability.prototype?.REGEXPS?.videos) ||
+  /\/\/(www\.)?((dailymotion|youtube|youtube-nocookie|player\.vimeo|v\.qq|bilibili|live\.bilibili)\.com|(archive|upload\.wikimedia)\.org|player\.twitch\.tv|brightcove\.com)/i;
+
 function isUnwanted(node) {
   if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
   const val = `${node.className || ''} ${node.id || ''} ${node.getAttribute('role') || ''}`.toLowerCase();
@@ -104,6 +108,9 @@ function getNodeTextLength(node) {
 }
 
 function getArticleForReader() {
+  const readabilityArticle = extractWithReadability();
+  if (readabilityArticle) return readabilityArticle;
+
   const main = extractMainCandidate();
 
   if (main) {
@@ -118,9 +125,6 @@ function getArticleForReader() {
       };
     }
   }
-
-  const readabilityArticle = extractWithReadability();
-  if (readabilityArticle) return readabilityArticle;
 
   if (main) {
     const cleaned = cleanupNode(main.cloneNode(true));
@@ -173,15 +177,29 @@ function extractMainCandidate() {
   return null;
 }
 
+function prepareDocumentForReadability() {
+  const html = document.documentElement.outerHTML;
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const root = doc.documentElement;
+
+  hydrateLazyText(root);
+  unwrapNoscriptImages(root);
+  hydrateMediaSources(root);
+  fixLazyImages(root);
+
+  return doc;
+}
+
 function extractWithReadability() {
   if (typeof Readability !== 'function') return null;
   try {
-    const html = document.documentElement.outerHTML;
-    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const doc = prepareDocumentForReadability();
     const location = document.location;
     const reader = new Readability(doc, {
       debug: false,
-      uri: location
+      uri: location,
+      allowedVideoRegex: ALLOWED_VIDEO_REGEX,
+      charThreshold: 200
     });
     const article = reader.parse();
     if (!article || !article.content) return null;
@@ -190,13 +208,19 @@ function extractWithReadability() {
     container.innerHTML = article.content;
     const cleaned = cleanupNode(container);
     const textLength = getNodeTextLength(cleaned);
-    if (textLength < 200) return null;
+    if (textLength < 120) return null;
 
     return {
       contentNode: cleaned,
-      title: getTitle(),
-      metadata: getMetadata(document) || { author: article.byline || '', published: '' },
-      language: detectLanguage(cleaned)
+      title: getTitle(article.title || ''),
+      metadata:
+        getMetadata(document, {
+          byline: article.byline,
+          published: article.publishedTime || article.published,
+          siteName: article.siteName
+        }) ||
+        { author: article.byline || '', published: '' },
+      language: article.lang || detectLanguage(cleaned)
     };
   } catch (err) {
     console.warn('Zen Reader: Readability fallback failed', err);
@@ -217,12 +241,84 @@ function buildParagraphFallback() {
     const text = (node.innerText || node.textContent || '').trim();
     if (node.tagName === 'P' && text.length < 30) return;
     const clone = node.cloneNode(true);
+    hydrateLazyText(clone);
     fallback.appendChild(clone);
     added++;
   });
 
   if (added > 3) return fallback;
   return null;
+}
+
+// Populate nodes that defer text or HTML into data-* attributes or <template/> blocks
+function hydrateLazyText(root) {
+  if (!root) return;
+  const doc = root.ownerDocument || document;
+
+  const textAttrs = [
+    'data-text',
+    'data-content',
+    'data-body',
+    'data-article-body',
+    'data-description',
+    'data-copy',
+    'data-message'
+  ];
+  const htmlAttrs = ['data-lazy-html', 'data-html', 'data-body-html', 'data-raw-html'];
+
+  const textSelector = textAttrs.map((attr) => `[${attr}]`).join(',');
+  if (textSelector) {
+    root.querySelectorAll(textSelector).forEach((el) => {
+      if ((el.textContent || '').trim()) return;
+      for (const attr of textAttrs) {
+        const val = el.getAttribute(attr);
+        if (val && val.trim()) {
+          el.textContent = val.trim();
+          break;
+        }
+      }
+    });
+  }
+
+  const htmlSelector = htmlAttrs.map((attr) => `[${attr}]`).join(',');
+  if (htmlSelector) {
+    root.querySelectorAll(htmlSelector).forEach((el) => {
+      if ((el.innerHTML || '').trim()) return;
+      for (const attr of htmlAttrs) {
+        const val = el.getAttribute(attr);
+        if (val && /<.+>/.test(val)) {
+          const frag =
+            doc.createRange && doc.createRange().createContextualFragment
+              ? doc.createRange().createContextualFragment(val)
+              : null;
+          if (frag) {
+            el.appendChild(frag);
+          } else {
+            el.innerHTML = val;
+          }
+          break;
+        }
+      }
+    });
+  }
+
+  root.querySelectorAll('template').forEach((tpl) => {
+    if (tpl.dataset?.rmHydrated === '1') return;
+    const content = tpl.content ? tpl.content.cloneNode(true) : null;
+    const text = content ? (content.textContent || '').trim() : (tpl.textContent || '').trim();
+    if (!text || text.length < 80) return;
+    const parent = tpl.parentNode;
+    if (!parent) return;
+    if (parent.childNodes.length > 1 && (parent.textContent || '').trim().length > 40) return;
+    if (content) {
+      parent.appendChild(content);
+    } else {
+      const wrapper = doc.createElement('div');
+      wrapper.innerHTML = tpl.innerHTML;
+      while (wrapper.firstChild) parent.appendChild(wrapper.firstChild);
+    }
+    tpl.dataset.rmHydrated = '1';
+  });
 }
 
 // Parse <noscript> wrappers that contain real images/pictures and inject them back into the live DOM
@@ -249,6 +345,7 @@ function unwrapNoscriptImages(root) {
 
 // Try to hydrate lazy-loaded media using data-* attributes from the source page
 function hydrateMediaSources(root) {
+  const doc = root.ownerDocument || document;
   const placeholderRe = /(transparent|spacer\.gif|1x1)/i;
   const srcAttrs = [
     'data-src',
@@ -264,6 +361,7 @@ function hydrateMediaSources(root) {
     'data-src-small'
   ];
   const srcsetAttrs = ['data-srcset', 'data-srcset-large', 'data-srcset-medium', 'data-srcset-small', 'data-original-set', 'data-lazy-srcset'];
+  const posterAttrs = ['data-poster', 'data-thumb', 'data-thumbnail', 'data-preview'];
 
   const setIfNeeded = (el, attr, val) => {
     if (!val) return;
@@ -272,9 +370,14 @@ function hydrateMediaSources(root) {
     el.setAttribute(attr, val);
   };
 
-  root.querySelectorAll('img, source').forEach((el) => {
+  root.querySelectorAll('img, source, video').forEach((el) => {
     srcAttrs.forEach((name) => setIfNeeded(el, 'src', el.getAttribute(name)));
     srcsetAttrs.forEach((name) => setIfNeeded(el, 'srcset', el.getAttribute(name)));
+  });
+
+  root.querySelectorAll('video').forEach((video) => {
+    posterAttrs.forEach((name) => setIfNeeded(video, 'poster', video.getAttribute(name)));
+    if (!video.getAttribute('preload')) video.setAttribute('preload', 'metadata');
   });
 
   root.querySelectorAll('figure').forEach((fig) => {
@@ -282,7 +385,7 @@ function hydrateMediaSources(root) {
     const src = fig.getAttribute('data-src');
     const srcset = fig.getAttribute('data-srcset');
     if (!src && !srcset) return;
-    const img = document.createElement('img');
+    const img = doc.createElement('img');
     if (src) img.setAttribute('src', src);
     if (srcset) img.setAttribute('srcset', srcset);
     fig.appendChild(img);
@@ -291,6 +394,7 @@ function hydrateMediaSources(root) {
 
 // Port of Readability's lazy-image fixer to pull real src/srcset values through
 function fixLazyImages(root) {
+  const doc = root.ownerDocument || document;
   const b64Re = /data:image\/(\w+);base64,/;
   const srcsetUrl = /(\S+)(\s+[\d.]+[xw])?(\s*(?:,|$))/g;
   const srcsetCandidate = /\.(jpe?g|png|webp|gif|avif|bmp)/i;
@@ -329,7 +433,7 @@ function fixLazyImages(root) {
         if (elem.tagName === 'IMG' || elem.tagName === 'PICTURE' || elem.tagName === 'SOURCE') {
           elem.setAttribute(copyTo, attr.value);
         } else if (elem.tagName === 'FIGURE' && !elem.querySelector('img, picture')) {
-          const img = document.createElement('img');
+          const img = doc.createElement('img');
           img.setAttribute(copyTo, attr.value);
           elem.appendChild(img);
         }
@@ -346,12 +450,13 @@ function fixLazyImages(root) {
 
 // Group content under headings into sections for clearer separation
 function wrapSections(contentNode) {
+  const doc = contentNode.ownerDocument || document;
   const children = Array.from(contentNode.childNodes);
   while (contentNode.firstChild) contentNode.removeChild(contentNode.firstChild);
   let currentSection = null;
 
   const startSection = () => {
-    currentSection = document.createElement('div');
+    currentSection = doc.createElement('div');
     currentSection.className = 'rm-section';
     contentNode.appendChild(currentSection);
   };
@@ -363,10 +468,45 @@ function wrapSections(contentNode) {
   });
 }
 
+function removeDuplicateTitle(contentNode, title) {
+  if (!contentNode || !title) return;
+  const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const normalizedTitle = normalize(title);
+  if (!normalizedTitle) return;
+
+  const firstHeading = contentNode.querySelector('h1, h2');
+  if (!firstHeading) return;
+  const headingText = normalize(firstHeading.innerText || firstHeading.textContent || '');
+  if (!headingText) return;
+
+  const exactMatch = headingText === normalizedTitle;
+  const partialMatch = normalizedTitle.startsWith(headingText) || headingText.startsWith(normalizedTitle);
+  if (exactMatch || partialMatch) {
+    firstHeading.remove();
+  }
+}
+
+function isAllowedVideoNode(el) {
+  if (!el) return false;
+  if (el.tagName === 'VIDEO') {
+    const hasSource = el.getAttribute('src') || el.querySelector('source');
+    return Boolean(hasSource);
+  }
+  const src = (el.getAttribute('src') || el.getAttribute('data-src') || '').trim();
+  if (src && ALLOWED_VIDEO_REGEX.test(src)) return true;
+  const source = el.querySelector?.('source[src], source[data-src], source[data-srcset]');
+  if (source) {
+    const sourceSrc = source.getAttribute('src') || source.getAttribute('data-src') || source.getAttribute('data-srcset') || '';
+    if (sourceSrc && ALLOWED_VIDEO_REGEX.test(sourceSrc)) return true;
+  }
+  return false;
+}
+
 function cleanupNode(root) {
   const container = document.createElement('div');
   container.className = 'rm-reader-article';
 
+  hydrateLazyText(root);
   unwrapNoscriptImages(root);
   hydrateMediaSources(root);
   fixLazyImages(root);
@@ -374,9 +514,13 @@ function cleanupNode(root) {
   // Remove non-essential or potentially intrusive elements
   root
     .querySelectorAll(
-      'script, style, noscript, iframe, object, embed, form, button, input, select, textarea, nav, aside, [role="navigation"], [role="banner"], [role="complementary"], .advert, .ads, .social, .sidebar, .comment, .comments'
+      'script, style, noscript, form, button, input, select, textarea, nav, aside, [role="navigation"], [role="banner"], [role="complementary"], .advert, .ads, .social, .sidebar, .comment, .comments'
     )
     .forEach((el) => el.remove());
+
+  root.querySelectorAll('iframe, object, embed').forEach((el) => {
+    if (!isAllowedVideoNode(el)) el.remove();
+  });
 
   // Strip inline event handlers to avoid executing page JS
   root.querySelectorAll('*').forEach((el) => {
@@ -401,11 +545,18 @@ function cleanupNode(root) {
     'LI',
     'BLOCKQUOTE',
     'B',
+    'I',
+    'EM',
+    'SPAN',
     'STRONG',
     'IMG',
     '#text',
     'FIGURE',
     'FIGCAPTION',
+    'PICTURE',
+    'SOURCE',
+    'VIDEO',
+    'IFRAME',
     'TABLE',
     'THEAD',
     'TBODY',
@@ -417,7 +568,7 @@ function cleanupNode(root) {
     'COLGROUP',
     'COL'
   ]);
-  const allowEmpty = new Set(['TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'TD', 'TH', 'CAPTION', 'COLGROUP', 'COL']);
+  const allowEmpty = new Set(['TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'TD', 'TH', 'CAPTION', 'COLGROUP', 'COL', 'SOURCE', 'VIDEO', 'IFRAME']);
 
   function appendClean(node, target) {
     if (node.nodeType === Node.TEXT_NODE) {
@@ -440,6 +591,19 @@ function cleanupNode(root) {
       if (!src) return;
       clone.removeAttribute('style');
     }
+    if (clone.nodeName === 'IFRAME' || clone.nodeName === 'OBJECT' || clone.nodeName === 'EMBED') {
+      if (!isAllowedVideoNode(node)) return;
+      if (!clone.getAttribute('src')) {
+        const dataSrc = node.getAttribute('data-src') || node.getAttribute('data-url');
+        if (dataSrc) clone.setAttribute('src', dataSrc);
+      }
+      clone.setAttribute('loading', 'lazy');
+      clone.setAttribute('referrerpolicy', 'no-referrer-when-downgrade');
+    }
+    if (clone.nodeName === 'VIDEO') {
+      clone.setAttribute('controls', 'controls');
+      if (!clone.hasAttribute('preload')) clone.setAttribute('preload', 'metadata');
+    }
 
     node.childNodes.forEach((child) => appendClean(child, clone));
     if (clone.childNodes.length === 0 && clone.nodeName !== 'IMG' && !allowEmpty.has(clone.nodeName)) return;
@@ -460,6 +624,8 @@ function getTitle(fallback = '') {
     'meta[itemprop="headline"]'
   ];
 
+  if (fallback) candidates.push(fallback.trim());
+
   metaSelectors.forEach((sel) => {
     const el = document.querySelector(sel);
     const val = el?.getAttribute('content');
@@ -467,7 +633,6 @@ function getTitle(fallback = '') {
   });
 
   if (document.title) candidates.push(document.title.trim());
-  if (fallback) candidates.push(fallback.trim());
 
   const cleaned = candidates
     .filter(Boolean)
@@ -478,7 +643,11 @@ function getTitle(fallback = '') {
   return preferred || 'Zen Reader';
 }
 
-function getMetadata(mainContent) {
+function getMetadata(mainContent, hints = {}) {
+  const hintByline = hints.byline && hints.byline.trim ? hints.byline.trim() : '';
+  const hintPublished = hints.published || hints.publishedTime || '';
+  const hintAuthorUrl = hints.authorUrl || '';
+  const hintSiteName = hints.siteName || '';
   const findText = (selector) => {
     const el = mainContent.querySelector(selector) || document.querySelector(selector);
     return el ? el.textContent.trim() : '';
@@ -491,8 +660,12 @@ function getMetadata(mainContent) {
 
   const authorMeta = document.querySelector('meta[name="author"]');
   const authorLinkEl = authorElement?.closest('a') || (authorElement?.tagName === 'A' ? authorElement : authorElement?.querySelector?.('a'));
-  const author = authorElement?.textContent.trim() || authorMeta?.getAttribute('content') || findText('meta[name="author"]');
-  const authorUrl = authorLinkEl?.href || '';
+  const author =
+    hintByline ||
+    authorElement?.textContent.trim() ||
+    authorMeta?.getAttribute('content') ||
+    findText('meta[name="author"]');
+  const authorUrl = hintAuthorUrl || authorLinkEl?.href || '';
 
   const dateElement =
     mainContent.querySelector('time[datetime], time, [itemprop="datePublished"]') ||
@@ -504,7 +677,7 @@ function getMetadata(mainContent) {
     ) || dateElement;
 
   const dateText = dateAttr?.getAttribute('content') || dateAttr?.getAttribute('datetime') || dateAttr?.textContent;
-  const published = dateText ? formatDate(dateText) : '';
+  const published = hintPublished ? formatDate(hintPublished) : dateText ? formatDate(dateText) : '';
 
   const removeLine = (el) => {
     if (!el || !mainContent || mainContent.nodeType === Node.DOCUMENT_NODE) return;
@@ -520,7 +693,7 @@ function getMetadata(mainContent) {
   removeLine(authorElement);
   removeLine(dateElement);
 
-  return { author, authorUrl, published };
+  return { author, authorUrl, published, siteName: hintSiteName };
 }
 
 function formatDate(raw) {
@@ -542,6 +715,7 @@ function buildOverlay({ theme, fontSize, title, metadata, contentNode, language 
   overlay.id = OVERLAY_ID;
   overlay.className = `rm-reader-overlay rm-theme-${theme} rm-images-on`;
   overlay.dataset.lang = language;
+  ensureFontForLanguage(language);
   applyStateToOverlay(overlay);
 
   const inner = document.createElement('div');
@@ -597,8 +771,6 @@ function buildOverlay({ theme, fontSize, title, metadata, contentNode, language 
 
   const styleUI = buildStylePanel(overlay, language);
 
-  const outlineUI = buildOutline(contentNode, overlay);
-
   const returnTopBtn = document.createElement('button');
   returnTopBtn.type = 'button';
   returnTopBtn.className = 'rm-move-top';
@@ -610,6 +782,7 @@ function buildOverlay({ theme, fontSize, title, metadata, contentNode, language 
 
   header.append(titleEl, metaEl);
 
+  removeDuplicateTitle(contentNode, title);
   wrapSections(contentNode);
 
   const body = document.createElement('div');
@@ -647,17 +820,14 @@ function buildOverlay({ theme, fontSize, title, metadata, contentNode, language 
   overlay.append(
     closeBtn,
     styleUI.toggleBtn,
-    outlineUI.toggleBtn,
     imagesToggle,
     linksToggle,
     returnTopBtn,
     styleUI.panel,
-    outlineUI.panel,
     inner
   );
   overlay._cleanup = () => {
     styleUI.cleanup();
-    outlineUI.cleanup();
   };
   return overlay;
 }
@@ -667,6 +837,24 @@ function setTheme(overlay, theme) {
   THEME_CLASSES.forEach((c) => overlay.classList.remove(c));
   overlay.classList.add(`rm-theme-${next}`);
   currentState.theme = next;
+}
+
+function ensureFontForLanguage(language) {
+  const fallback = language === 'zh' ? FONT_FALLBACK_CJK : FONT_FALLBACK_LATIN;
+  const isFallback = (value) => {
+    return value === FONT_FALLBACK || value === FONT_FALLBACK_LATIN || value === FONT_FALLBACK_CJK;
+  };
+
+  if (!currentState.fontFamily || isFallback(currentState.fontFamily)) {
+    currentState.fontFamily = fallback;
+  }
+
+  if (language === 'zh' && currentState.fontFamily === FONT_FALLBACK_LATIN) {
+    currentState.fontFamily = fallback;
+  }
+  if (language !== 'zh' && currentState.fontFamily === FONT_FALLBACK_CJK) {
+    currentState.fontFamily = fallback;
+  }
 }
 
 function applyStateToOverlay(overlay) {
@@ -923,119 +1111,6 @@ function updateAlignActive(container, align) {
     if (btn.textContent.toLowerCase() === align) btn.classList.add('active');
     else btn.classList.remove('active');
   });
-}
-
-function buildOutline(contentNode, overlay) {
-  const ensureId = (el, idx) => {
-    if (el.id) return el.id;
-    const generated = `rm-outline-${idx}`;
-    el.id = generated;
-    return generated;
-  };
-
-  const collectHeadings = () => {
-    const results = [];
-    const headingSelectors = 'h1, h2, h3, h4, [role="heading"]';
-    Array.from(contentNode.querySelectorAll(headingSelectors)).forEach((el, idx) => {
-      const text = (el.innerText || el.textContent || '').trim();
-      if (!text) return;
-      const ariaLevel = parseInt(el.getAttribute('aria-level'), 10);
-      const tagLevel = el.tagName && el.tagName.toLowerCase().startsWith('h') ? parseInt(el.tagName.slice(1), 10) : 2;
-      const level = Number.isFinite(ariaLevel) ? Math.min(Math.max(ariaLevel, 1), 4) : Math.min(tagLevel || 2, 4);
-      results.push({ el, text, level });
-    });
-
-    if (results.length === 0) {
-      // Fallback: treat short bold-only paragraphs as section headers
-      Array.from(contentNode.querySelectorAll('p')).forEach((p) => {
-        const text = (p.innerText || p.textContent || '').trim();
-        if (!text) return;
-        const hasStrong = !!p.querySelector('strong, b');
-        const isShort = text.length > 4 && text.length < 120;
-        if (hasStrong && isShort) {
-          results.push({ el: p, text, level: 3 });
-        }
-      });
-    }
-
-    return results;
-  };
-
-  const toggleBtn = document.createElement('button');
-  toggleBtn.type = 'button';
-  toggleBtn.className = 'rm-outline-toggle';
-  toggleBtn.textContent = 'Show outline';
-  toggleBtn.title = 'Toggle outline navigation';
-
-  const panel = document.createElement('nav');
-  panel.className = 'rm-outline-panel';
-
-  const headings = collectHeadings();
-
-  if (headings.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'rm-outline-empty';
-    empty.textContent = 'No outline available';
-    panel.appendChild(empty);
-  } else {
-    const list = document.createElement('div');
-    list.className = 'rm-outline-list';
-
-    headings.slice(0, 30).forEach((heading, idx) => {
-      const text = heading.text;
-      const level = heading.level;
-      const anchorId = ensureId(heading.el, idx);
-
-      const link = document.createElement('a');
-      link.className = `rm-outline-link level-${level}`;
-      link.href = `#${anchorId}`;
-      link.textContent = text;
-      link.addEventListener('click', (e) => {
-        e.preventDefault();
-        const target = document.getElementById(anchorId);
-        if (!target) return;
-        const scrollParent = overlay || target.closest(`#${OVERLAY_ID}`);
-        if (scrollParent && typeof scrollParent.scrollTo === 'function') {
-          const parentRect = scrollParent.getBoundingClientRect();
-          const targetRect = target.getBoundingClientRect();
-          const offset = targetRect.top - parentRect.top - 20;
-          scrollParent.scrollTo({ top: scrollParent.scrollTop + offset, behavior: 'smooth' });
-        } else {
-          target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
-      });
-      list.appendChild(link);
-    });
-
-    if (list.childNodes.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'rm-outline-empty';
-      empty.textContent = 'No outline available';
-      panel.appendChild(empty);
-    } else {
-      panel.appendChild(list);
-    }
-  }
-
-  toggleBtn.addEventListener('click', () => {
-    panel.classList.toggle('open');
-  });
-
-  const outsideHandler = (e) => {
-    if (!panel.classList.contains('open')) return;
-    if (panel.contains(e.target) || toggleBtn.contains(e.target)) return;
-    panel.classList.remove('open');
-  };
-
-  document.addEventListener('mousedown', outsideHandler, true);
-  document.addEventListener('touchstart', outsideHandler, true);
-
-  const cleanup = () => {
-    document.removeEventListener('mousedown', outsideHandler, true);
-    document.removeEventListener('touchstart', outsideHandler, true);
-  };
-
-  return { toggleBtn, panel, cleanup };
 }
 
 // Detect dominant language by counting Latin vs CJK characters in the cleaned content
